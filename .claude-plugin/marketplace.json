@@ -4,9 +4,9 @@
   "version": "1.0.1",
   "description": "Structured AI workflows for better product decisions. 65 domain-specific skills and 36 chained workflows across 8 PM plugins — from discovery to strategy, execution, launch, and growth.",
   "owner": {
-    "name": "Paweł Huryn",
-    "email": "pawel@productcompass.pm",
-    "url": "https://www.productcompass.pm"
+    "name": "",
+    "email": "",
+    "url": ""
   },
   "plugins": [
     {
