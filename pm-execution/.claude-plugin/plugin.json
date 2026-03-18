@@ -1,7 +1,7 @@
 {
   "name": "pm-execution",
-  "version": "1.0.2",
-  "description": "Execution and product management skills: PRDs, OKRs, roadmaps, sprints, pre-mortems, stakeholder maps, user stories, prioritization frameworks, and more.",
+  "version": "1.0.3",
+  "description": "Execution and product management skills: PRDs, OKRs, roadmaps, sprints, pre-mortems, stakeholder maps, user stories, prioritization frameworks, stakeholder updates, quarterly planning, and more.",
   "author": {
     "name": "Abhishek Choudhari",
     "url": "https://www.linkedin.com/in/abhishekchoudhari/"
