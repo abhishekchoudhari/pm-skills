@@ -2,3 +2,7 @@ _Internal/
 CLAUDE.md
 .DS_Store
 **/.DS_Store
+
+# Apps Script files with private sheet IDs / emails — keep local only
+**/*.gs
+!**/*.template.gs
