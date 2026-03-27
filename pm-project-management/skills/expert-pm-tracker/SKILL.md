@@ -48,6 +48,26 @@ Vendor discovery (Setup Wizard Step B and Phase 3 Step 8) fetches subject lines 
 **Rule 8 — Deeper reads are always user-initiated.**
 Never automatically read beyond 10 messages. If a user asks to go deeper on a specific line item, read up to the full thread for that item only, on demand.
 
+**Rule 9 — Never use `append_sheet_values` to add new rows.**
+`append_sheet_values` fails with a protobuf serialization error in this MCP server. To add a new row: first call `get_sheet_values` on column A to find the last occupied row, then write with `update_sheet_values` using an explicit range (e.g. `A11:K11`).
+
+**Rule 10 — Master sheet initiative matching uses Sheet ID, not display name.**
+The Master Dashboard has a `Sheet ID` column (col I). Always match initiative rows by Sheet ID (exact string match against `cfg.sheetId`) — never by display name. Display names like `"VendorInitiative"` and config keys like `"VendorInitiative"` will not match. This applies to both Claude-driven syncs (MCP `update_sheet_values`) and Apps Script (`updateAllMasterSheetEntries`). Both write to the same `Last Sync (Script)` column.
+
+**Rule 11 — Thread filter: four pre-analysis gates before Claude sees a thread.**
+Before sending any thread to Claude, apply four sequential filters (all free — no API call):
+1. **Subject keyword gate**: Drop threads whose subject matches maintenance/OOO/NDR/automated patterns (e.g. "planned maintenance", "out of office", "undelivered mail"). See `SKIP_SUBJECT_PATTERNS` in the script.
+2. **Relay domain gate**: Messages relayed through security gateways (e.g. trendmicro.com, mimecast.com) do not count as genuine vendor messages.
+3. **Substantive vendor gate**: Thread must either (a) start with a message from the vendor, or (b) contain 2+ genuine vendor messages. Prevents internal threads where a vendor merely replied once as a CC.
+4. **Activity gate**: Thread must have activity since `last_sync`.
+These filters together eliminate downtime notifications, security relay noise, and internal threads from reaching Claude analysis.
+
+**Rule 12 — Three-tier deduplication: Thread ID → semantic → new.**
+Before appending any row, apply dedup in order:
+1. **Thread ID exact match**: Source column stores `Gmail:<threadId> (DD MMM YYYY)`. Parse the ID and match against existing Source values — O(1), free, no API call. On match: update that row's Latest Update, Risk Score, Risk, Action Pending On, and Last Updated. Never overwrite Task, Category, SPOC, ETA, or Status (user may have edited these).
+2. **Claude semantic fallback**: Only if no Thread ID match. Call `checkDuplicate(subject, context, existingTasks)` — handles Re:/Fwd: prefixes, paraphrasing, and cross-initiative duplicates (e.g. `"YourTeam VendorA VendorB product feature certification"` → `"product feature certification"`). On API failure, treat as new.
+3. **New row**: If neither tier matches, append with all fields from the extended `analyzeRisk()` call.
+
 ---
 
 ## Phase 0 — Preflight (run on every invocation)
@@ -68,7 +88,7 @@ Do not proceed until MCP is confirmed active.
 
 ### Step 2: Detect company domain
 
-Read the authenticated Gmail account address. Extract the domain (e.g. `jupiter.money` from `user@jupiter.money`). Store this as the company domain. All email threads from other domains are treated as external vendors.
+Read the authenticated Gmail account address. Extract the domain (e.g. `yourcompany.com` from `user@yourcompany.com`). Store this as the company domain. All email threads from other domains are treated as external vendors.
 
 ### Step 3: Check config file
 
@@ -296,6 +316,29 @@ For each vendor name provided:
 - Ask if there are specific contacts at this vendor to watch, or monitor the whole domain
 - Ask for any focus keywords or subject lines to narrow the scan (optional)
 
+### Step 2b: Identify internal SPOCs and team context
+
+After confirming vendors, ask:
+
+> "Who on your team owns this initiative?
+>
+> For each topic area or vendor track, tell me:
+> - **Owner name** — first name is enough
+> - **What they own** — e.g. 'compliance items', 'tech integrations', 'ops and reconciliation', 'regulatory filings'
+>
+> Example: 'Priya → compliance and risk; Rohan → tech and API; Neha → ops and reconciliation; Arjun → regulatory and audit'
+>
+> If you're the only owner, just say so. This helps the AI assign the right SPOC when it reads email threads."
+
+Store the answer as a single `teamContext` string in the initiative config:
+```
+teamContext: "Priya → compliance and risk; Rohan → tech and API; Neha → ops; Arjun → regulatory"
+```
+
+This field is injected into every Claude batch analysis prompt so SPOC detection uses real team structure rather than guessing from email addresses alone.
+
+**If the user adds multiple initiatives at once**, ask the team context question once per initiative (not once overall) — each initiative may have a different owner breakdown.
+
 ### Step 3: Import existing data (optional)
 
 If the user has existing tracker data:
@@ -309,21 +352,58 @@ All imported rows are written with today's date in the current week's Update col
 
 **If connecting an existing sheet:**
 - Read the sheet structure
-- Check for required columns
+- Check for required columns (A–M, see column schema at top of this file)
 - Ask permission to add any missing columns
 - Do not delete or move existing columns
 
 **If creating a new sheet:**
-- Create a new Google Sheet named after the initiative
-- Set up the schema (see Sheet Schema section)
-- Share the sheet URL with the user
+1. Use `create_spreadsheet` to create a new Google Sheet named after the initiative
+2. Rename the default tab from "Sheet1" to `Open Items` (or whatever the user sets as `sheetTab`)
+   — Apps Script `formatAllSheets()` matches by tab name and will silently fail if it finds "Sheet1"
+3. Write the 13 column headers in row 1: `Task / Category / Internal SPOC / ETA / Status / Latest Update / Commitments / Risk Score / Risk / Vendor / Source / Action Pending On / Last Updated`
+4. Share the sheet URL with the user and note the Sheet ID for config
 
-### Step 5: Update config
+Dropdowns and conditional formatting must be applied via Apps Script `formatAllSheets()` — MCP cannot set data validation or conditional format rules.
 
-Add the new initiative to `~/.config/pm-project-management/config.json` with all fields from Step 1 and Step 2.
+### Step 5: Update config and complete setup
+
+**5a. Update local config**
+
+Add the new initiative to `~/.config/pm-project-management/config.json` with all fields from Steps 1, 2, and 2b (including `teamContext`).
+
+**5b. Add row to Master Dashboard**
+
+Write a new row to the Master Dashboard Google Sheet (the sheet at `MASTER_SHEET_ID`). Fill in these columns:
+
+| Column | Value |
+|--------|-------|
+| Initiative (A) | Initiative display name |
+| Tracker Link (B) | `https://docs.google.com/spreadsheets/d/<sheetId>` |
+| Vendors (C) | Comma-separated vendor names |
+| Open HIGH (D) | 0 |
+| Open MEDIUM (E) | 0 |
+| Open LOW (F) | 0 |
+| Sheet ID (I) | Exact Google Sheet ID string |
+
+Leave columns G, H, J, K, L blank — Apps Script will fill these on first sync.
+
+Note: If you skip this step, Apps Script will auto-create the master row on the first sync run, but it will be missing the Initiative display name and Tracker Link columns which it cannot infer.
+
+**5c. Add initiative to the _Config tab**
+
+If the Apps Script scheduler is already running:
+1. Open the Master Dashboard Google Sheet → go to the `_Config` tab
+2. Add a new row with all fields: Initiative (key name, no spaces), Sheet ID, Sheet Tab, Vendor Domains (comma-separated), Vendor Names (comma-separated), Focus Contacts (comma-separated), Team Context, Deadline (YYYY-MM-DD or blank), Lookback Days, Description
+3. In the Apps Script editor, edit `addNewInitiativeSetup()`: set `initiativeName` to match the value in column A exactly
+4. Run `addNewInitiativeSetup()` to initialise sync timestamps and validate the sheet
+5. Run `formatAllSheets()` to apply headers, dropdowns, and conditional formatting to the new sheet
+
+No changes to `pm-tracker.gs` are needed — the script reads config from the `_Config` tab automatically.
+
+If the scheduler is not yet set up, proceed to Phase 6.
 
 Notify the user:
-> "Initiative added. Run the scheduler setup (Option E) to include this initiative in the next automated sync."
+> "Initiative added and configured. The next scheduled sync (or a manual `syncAll()` run) will scan the last N days of email and populate the sheet."
 
 ---
 
@@ -386,9 +466,9 @@ After the batch write, read the Thread ID and Status columns only. If any rows w
 
 **After writing:** Update `last_sync` to current UTC timestamp.
 
-### Step 4: Risk scoring
+### Step 4: Risk scoring and field extraction
 
-For each row (new or updated), compute the risk score:
+For each row (new or updated), compute the risk score. The `analyzeRisk()` Claude Haiku call returns all fields in one response — no separate calls needed for metadata extraction.
 
 ```
 Score = (0.30 × time_score) + (0.25 × eta_score) + (0.25 × tone_score) + (0.20 × velocity_score)
@@ -427,14 +507,47 @@ Cap the final score at 3.00.
 - 1.67 – 2.33 → Medium
 - 2.33 – 3.00 → High
 
-Write the score to the Risk Score column as: `2.4 — HIGH`
+Write the outputs to **two separate columns**:
+- **Risk Score column** (`riskScoreCol`): numeric value rounded to 2 decimal places, e.g. `2.35`
+- **Risk column** (`riskCol`): label only — `HIGH`, `MEDIUM`, `LOW`, or `TBD`
 
-### Step 5: Apply color coding to Risk Score cell
+`riskScoreCol` is always immediately left of `riskCol` (i.e. `riskCol - 1`).
 
-Use Google Sheets API to set the background color of the Risk Score cell:
-- High → Red background (#F4CCCC), dark red text (#990000)
-- Medium → Amber background (#FCE5CD), dark orange text (#B45309)
-- Low → Green background (#D9EAD3), dark green text (#274E13)
+**Extended fields extracted in the same call:**
+- `category`: Ops / Feature / Compliance / Tech / Process / Testing / Certification / Risk / CX
+- `spoc`: first name of the internal team member responsible (from your company domain address or mentioned as owner), or `"Unknown"`
+- `eta_date`: any delivery date mentioned (DD MMM), or `"-"`
+- `status`: infer from tone — Open / In Progress / In Review / To be Picked
+- `action_pending_on`: value of `INTERNAL_TEAM_NAME` if the vendor's last message asks your team to act, else the vendor name
+
+If the score calculation is inconclusive (e.g. ETA unknown, very short snippet), write `TBD` in the Risk column and leave Risk Score blank.
+
+**Stale row escalation:** After each sync run, scan all non-Done/Closed rows. Any row with no Last Updated in 14+ days has its Risk Score bumped +0.3 (capped at 3.00) automatically — no Claude call needed.
+
+### Step 5: Cell formatting for Risk and Status columns
+
+Formatting is applied via Apps Script `formatSheet()` — not via MCP (which is values-only).
+
+**Risk column** (`riskCol`): dropdown validation + conditional formatting (text color only, no background fill)
+- Dropdown options: `HIGH / MEDIUM / LOW / TBD`
+- HIGH → red text `#cc0000`, bold
+- MEDIUM → amber-yellow text `#ca8a04`, bold
+- LOW → green text `#274e13`, bold
+- TBD → grey text `#888888`, normal
+
+**Risk Score column** (`riskScoreCol`): number format `0.00`, right-aligned, no dropdown
+
+**Status column** (`statusCol`): dropdown validation + conditional formatting (text color only)
+- Dropdown options: `Open / In Progress / In Review / Done / Closed / To be Picked / Solutionizing`
+- Done / Closed → green text `#274e13`, bold
+- In Progress → amber-yellow text `#ca8a04`
+- In Review → purple text `#6d28d9`
+- Open → orange text `#b45309`
+- To be Picked / Solutionizing → grey text `#555555`
+
+**Action Pending On column** (`actionCol`): dynamic dropdown built from `cfg.vendorNames` + `INTERNAL_TEAM_NAME` + `"Unknown"`. `setAllowInvalid(true)` so users can type unlisted names. Conditional formatting: `INTERNAL_TEAM_NAME` value = orange text `#b45309` bold (you need to act).
+
+**Last Updated column** (`totalCols + 1`): plain text timestamp in user's local timezone (`Session.getScriptTimeZone()`), format `DD MMM YYYY HH:MM`. Written only when a row is actually added or changed — never on a no-op scan pass.
 
 ### Step 6: Update weekly columns
 
@@ -512,69 +625,81 @@ Also flag initiative-level deadline proximity:
 
 ## Phase 6 — Scheduler Setup (Apps Script)
 
-### Step 1: Explain what will be generated
+### Automation architecture
 
-Tell the user:
-> "I will generate a Google Apps Script that:
-> - Runs automatically at 10am, 3pm, and 7pm in your local timezone
-> - Scans Gmail for new vendor threads since the last run
-> - Updates all your initiative sheets with new information and risk scores
-> - Sends one summary email at 10am only (not at 3pm or 7pm)
-> - Uses Claude API for tone analysis and risk scoring
-> - Reads initiative config from a master Config sheet so you never need to redeploy when adding initiatives
->
-> You will need to deploy this once to Google Apps Script. I will walk you through it step by step."
+Apps Script is the **primary and only automation layer**. It runs fully autonomously on Google's infrastructure — no dependency on Claude Code being open, idle, or connected.
 
-### Step 2: Create master Config sheet
+| Layer | Role | When |
+|-------|------|------|
+| **Apps Script + Claude API** | Primary automation — Gmail scan, AI risk scoring via `claude-haiku-4-5-20251001`, sheet writes, summary email, master sheet timestamp update | 2× daily always |
+| **Claude Code** | On-demand — deep analysis, new initiative setup, config changes, retrospective bulk sync | When you explicitly invoke it |
 
-Create a new Google Sheet called `PM_Tracker_Config` with two tabs:
+Session CronJobs are not used. `launchd + claude -p` does not work for MCP-dependent tasks (MCP cannot connect in non-interactive mode).
 
-**Tab: Initiatives**
-```
-| Initiative | Sheet URL | Vendor Name | Vendor Domain | Focus Keywords | Initiative Deadline | Active |
-```
-Populate from current config. Store Sheet URL as a clickable hyperlink using the Sheets `=HYPERLINK(url, initiative_name)` formula — not plain text — so the user can navigate directly to each tracker from this sheet.
+### Step 1: Prerequisites
 
-**Tab: Sync_Log**
-```
-| Timestamp | Initiative | Threads Scanned | Rows Updated | New Rows | New Vendors Detected | Status |
-```
+Before generating the script, confirm:
+1. User has an Anthropic API key from `console.anthropic.com` (stored in Apps Script PropertiesService — never in code)
+2. `MASTER_SHEET_ID` is known (PM Tracker Master Dashboard)
+3. Each initiative has `sheetId`, `sheetTab`, `vendorDomains`, `vendorNames`, `focusContacts`, `teamContext`, `initiativeDeadline`, and `scan_lookback_days` ready — these go into the `_Config` tab, not into code
 
-### Step 3: Generate the Apps Script
+### Step 2: Script template
 
-Generate the complete Apps Script file customised for the user. The script must:
+The repository contains the ready-to-use template at:
+`apps-script/pm-tracker.template.gs`
 
-- Read initiative config from the `PM_Tracker_Config` sheet (not hardcoded)
-- Store all secrets in `PropertiesService` (never inline)
-- Run `syncAll()` at 10am, 3pm, and 7pm
-- Run `sendDailySummary()` at 10am only
-- Use `UrlFetchApp` to call Claude API (`claude-sonnet-4-6`) for tone analysis
-- Apply initiative deadline modifier to risk scoring
-- Apply color coding via Sheets API
-- Handle weekly column rotation
-- Log each run to the Sync_Log tab
-- Include a `setup()` function that sets up all triggers and prompts for PropertiesService values
+This file is committed to the public repo. The real `pm-tracker.gs` (with real sheet IDs, email, and API key reference filled in) is gitignored via `**/*.gs` + `!**/*.template.gs`.
 
-Provide the complete script as a code block the user can copy in full.
+### Step 3: Fill in and deploy
 
-### Step 4: Deployment walkthrough
+1. Copy `pm-tracker.template.gs` → `pm-tracker.gs` in the same directory
+2. Fill in four values at the top of the file: `SUMMARY_EMAIL`, `USER_DOMAIN`, `MASTER_SHEET_ID`, `INTERNAL_TEAM_NAME`
+   — All initiative config lives in the `_Config` tab; no code changes needed for initiatives
+3. Go to `script.google.com` → New project → paste `pm-tracker.gs`
+4. Open **Project Settings** (gear icon) → **Script Properties** → add:
+   - Key: `ANTHROPIC_API_KEY` — Value: `sk-ant-...`
+5. Run `setupConfigTab()` once to create the `_Config` tab in the Master Dashboard, pre-populated with your initiatives
+6. Edit the `_Config` tab rows to verify all fields are correct (Sheet IDs, vendor domains, teamContext, etc.)
+7. Run `setupProperties()` once to initialise sync timestamps and validate the API key
+8. Run `formatAllSheets()` once to apply formatting, dropdowns, and conditional rules to all sheets
+9. Run `setupTriggers()` once to create the 10am / 5pm time-based triggers
+10. Authorise Gmail + Sheets + UrlFetch scopes when prompted
+11. Run `runIncrementalSync()` once manually to verify Claude API scoring works end to end
 
-> **Deploy the Apps Script scheduler:**
->
-> 1. Go to script.google.com — click **New project**
-> 2. Name the project `PM Tracker Scheduler`
-> 3. Delete the default code and paste the generated script
-> 4. Click **Save** (Ctrl+S)
-> 5. Run the `setup()` function once:
->    - Click the function dropdown at the top, select `setup`
->    - Click **Run**
->    - Approve the permissions popup (Gmail, Sheets, external URL calls)
->    - When prompted, paste your Anthropic API key, Config Sheet URL, and summary email address
-> 6. Verify triggers were created:
->    - Click **Triggers** (clock icon in left sidebar)
->    - You should see three time-based triggers: 10am, 3pm, 7pm
-> 7. Run `syncAll()` once manually to test it works
-> 8. Check your `PM_Tracker_Config` Sync_Log tab — you should see a success entry
+### Step 4: What runs automatically
+
+**At 10am:** `runMorningSyncAndEmail()` — Gmail scan + Claude API risk scoring + daily summary email
+**At 5pm:** `runIncrementalSync()` — Gmail scan + Claude API risk scoring, no email
+
+Per run, for each initiative:
+- Appends new vendor threads as rows with `Risk Score` (numeric) and `Risk` (label)
+- Writes `Last Updated` timestamp (user's local timezone) only on changed rows
+- Updates the initiative's `Last Sync (Script)` column in the Master Dashboard
+- Falls back to `Risk = TBD`, `Risk Score = ""` if API key is missing or call fails
+
+### Step 5: Master Dashboard — sync columns
+
+After each sync, Apps Script performs a **single-pass batch update** to the Master Dashboard (one sheet open, one data read, all initiative rows updated together):
+
+- **Last Sync (Script)** (col H): timestamp of the last automated sync
+- **New (Last Run)** (col K): count of new rows added in this run
+- **Updated (Last Run)** (col L): count of rows updated in this run
+- **Open HIGH / Open MEDIUM / Open LOW** (cols D-F): live counts of open items at each risk level, recounted after every sync
+
+Match initiative rows by **Sheet ID** (col I) — exact string match. Never match by display name.
+
+If any column doesn't exist yet, create it with the standard header style. If `Sheet ID` column is missing, log a warning and skip the update.
+
+### Step 6: Pausing or closing an initiative
+
+To stop scanning an initiative without losing its history or master sheet row:
+1. Open the Master Dashboard → `_Config` tab
+2. Set the `Active` column for that initiative to `N`
+3. The next sync will skip it entirely — no Gmail scan, no Claude calls, no sheet writes
+
+To reactivate: change `Active` back to `Y`. No other steps needed.
+
+Do not delete the `_Config` row — that would orphan the master sheet row and the existing tracker sheet data.
 
 ---
 
@@ -632,29 +757,82 @@ After confirmation:
 
 ---
 
+## Master Dashboard Schema
+
+One row per initiative. The master sheet is the single-pane view across all initiatives.
+
+| Col | Header | Description | Who writes |
+|-----|--------|-------------|-----------|
+| A | Initiative | Display name (e.g. `VendorInitiative`) | Manual |
+| B | Tracker Link | Hyperlink to the initiative sheet | Manual |
+| C | Vendors | Comma-separated vendor names | Manual |
+| D | Open HIGH | Count of HIGH risk open items | Manual / Claude sync |
+| E | Open MEDIUM | Count of MEDIUM risk open items | Manual / Claude sync |
+| F | Open LOW | Count of LOW risk open items | Manual / Claude sync |
+| G | Last Synced | Date of last manual review | Manual |
+| H | Last Sync (Script) | Timestamp of last automated or Claude sync | Apps Script + Claude Code |
+| I | Sheet ID | Google Sheet ID of the initiative tracker — **lookup key** | Set once, never changes |
+
+**Key rules:**
+- `Sheet ID` (col I) is the authoritative lookup key — always match initiative rows by Sheet ID, never by display name
+- `Last Sync (Script)` is written by both Apps Script and Claude Code — a single shared column, no separate "Last Sync (Claude)" column
+- When running a Claude-driven sync, after writing sheet updates, find the initiative's row via Sheet ID and write the current timestamp to `Last Sync (Script)`
+
+---
+
 ## Sheet Schema
 
 One sheet per initiative. Sheet name = initiative name (e.g. `PaymentGateway`).
 
-| Column | Description |
-|--------|-------------|
-| Vendor | Vendor company name |
-| Task Category | Feature / Operations / Compliance / Risk |
-| Task | One-line task description |
-| SPOC | Single point of contact at vendor |
-| ETA (Original) | First ETA mentioned in thread |
-| Updated ETA | Latest ETA (overwrite when updated) |
-| Status | To Do / In Progress / Blocked / In Review / Solutionising / Done |
-| Risk Score | Weighted score + label, e.g. `2.4 — HIGH` (color coded) |
-| Email Thread | Gmail thread permalink |
-| Thread ID | Internal dedup key — do not delete (hidden column) |
-| Source | email-sync / manual_import / manual_offline — for auditability |
-| Update DD-Mon | Weekly update — overwritten daily for 7 days, new column each Monday |
+All cell formatting (colors, dropdowns, frozen rows, column widths) is applied via Apps Script `formatAllSheets()` — not via MCP.
 
-**Color coding for Risk Score cell:**
-- High: red background `#F4CCCC`, text `#990000`
-- Medium: amber background `#FCE5CD`, text `#B45309`
-- Low: green background `#D9EAD3`, text `#274E13`
+### 12-column schema (standard — with Team Owner)
+
+| Col | # | Header | Description |
+|-----|---|--------|-------------|
+| A | 1 | Task | One-line task description — Claude-extracted from subject |
+| B | 2 | Category | Ops / Feature / Compliance / Tech / Process / Testing / Certification / Risk / CX |
+| C | 3 | SPOC | Your-team-side person responsible — Claude-extracted from email context |
+| D | 4 | Team Owner | Internal team — filled manually |
+| E | 5 | ETA | Full date: `DD MMM YYYY` — Claude-extracted |
+| F | 6 | Status | Dropdown: Open / In Progress / In Review / Done / Closed / To be Picked / Solutionizing |
+| G | 7 | Latest Update | One-sentence status summary — Claude-written |
+| H | 8 | Risk Score | Weighted numeric score e.g. `2.35` — format `0.00`, right-aligned |
+| I | 9 | Risk | Dropdown: HIGH / MEDIUM / LOW / TBD — color-coded text |
+| J | 10 | Vendor | Sender domain |
+| K | 11 | Source | `Gmail:<threadId> (DD MMM YYYY)` for email rows — Thread ID is the dedup key |
+| L | 12 | Action Pending On | Who needs to act: `[Your Team]` (orange) or vendor name — Claude-inferred |
+| M | 13 | Last Updated | Timestamp of last change: `25 Mar 2026 10:03` — auto-added |
+
+Apps Script config: `riskScoreCol: 8`, `riskCol: 9`, `statusCol: 6`, `actionCol: 12`, `totalCols: 12`
+
+### 11-column schema (compact — no Team Owner)
+
+| Col | # | Header | Description |
+|-----|---|--------|-------------|
+| A | 1 | Task | One-line task description |
+| B | 2 | Category | Ops / Feature / Compliance / Tech / Process / Testing / Certification / Risk / CX |
+| C | 3 | SPOC | Your-team-side person responsible |
+| D | 4 | ETA | Full date: `DD MMM YYYY` |
+| E | 5 | Status | Dropdown: Open / In Progress / In Review / Done / Closed / To be Picked / Solutionizing |
+| F | 6 | Latest Update | One-sentence status summary — Claude-written |
+| G | 7 | Risk Score | Weighted numeric score e.g. `2.35` — format `0.00`, right-aligned |
+| H | 8 | Risk | Dropdown: HIGH / MEDIUM / LOW / TBD — color-coded text |
+| I | 9 | Vendor | Sender domain |
+| J | 10 | Source | `Gmail:<threadId> (DD MMM YYYY)` — Thread ID is the dedup key |
+| K | 11 | Action Pending On | Who needs to act: `[Your Team]` (orange) or vendor name |
+| L | 12 | Last Updated | Timestamp of last change — auto-added |
+
+Apps Script config: `riskScoreCol: 7`, `riskCol: 8`, `statusCol: 5`, `actionCol: 11`, `totalCols: 11`
+
+**Key schema rules:**
+- `riskScoreCol` is always `riskCol - 1` (Risk Score immediately left of Risk)
+- `Last Updated` column is always `totalCols + 1` — added automatically, never in `totalCols` count
+- ETA: always full date `DD MMM YYYY` — never abbreviated `DD MMM`
+- Risk Score: numeric `0.00` format, right-aligned, no dropdown
+- Risk + Status: dropdown validation + conditional text color (no cell background fill)
+- Last Updated: written only when a row is added or changed, not on no-op scan passes
+- Timezone: `Session.getScriptTimeZone()` — reads from Google account settings, not hardcoded
 
 ---
 
