@@ -32,7 +32,7 @@ Execution and product management skills: PRDs, OKRs, roadmaps, sprints, pre-mort
 - `/pm-execution:stakeholder-map` — Map stakeholders on a Power × Interest grid and create a tailored communication plan.
 - `/pm-execution:test-scenarios` — Generate comprehensive test scenarios from user stories or feature specs — happy paths, edge cases, and error handling.
 - `/pm-execution:transform-roadmap` — Convert a feature-based roadmap into an outcome-focused roadmap that communicates strategic intent.
-- `/pm-execution:write-prd` — Create a comprehensive Product Requirements Document from a feature idea or problem statement.
+- `/pm-execution:create-prd` — Create a comprehensive Product Requirements Document from a feature idea or problem statement.
 - `/pm-execution:write-stories` — Break a feature into backlog items — user stories, job stories, or WWA format with acceptance criteria.
 
 ## Author

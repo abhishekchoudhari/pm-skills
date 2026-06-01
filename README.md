@@ -14,7 +14,7 @@ Designed for Claude Code and Cowork. Skills compatible with other AI assistants.
 
 New idea? → `/discover`  
 Need strategic clarity? → `/strategy`  
-Writing a PRD? → `/write-prd`  
+Writing a PRD? → `/create-prd`  
 Planning a launch? → `/plan-launch`  
 Defining metrics? → `/north-star`
 
@@ -211,7 +211,7 @@ Day-to-day product management: PRDs, OKRs, roadmaps, sprints, retrospectives, re
 
 **Commands (10):**
 
-- `/write-prd` — Create a PRD from a feature idea or problem statement
+- `/create-prd` — Create a PRD from a feature idea or problem statement
 - `/plan-okrs` — Brainstorm team-level OKRs
 - `/transform-roadmap` — Convert a feature-based roadmap into outcome-focused
 - `/sprint` — Sprint lifecycle (`plan|retro|release`)
@@ -230,7 +230,7 @@ Skills:
 - `What's the difference between Opportunity Score, ICE, and RICE?`
 
 Commands:
-- `/write-prd Smart notification system that reduces alert fatigue`
+- `/create-prd Smart notification system that reduces alert fatigue`
 - `/sprint retro — Here are the notes from our last sprint`
 - `/write-stories job — Break down the "team dashboard" feature into job stories`
 
